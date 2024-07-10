@@ -1,0 +1,220 @@
+trigger:
+  branches:
+    include:
+    - feature/*
+    - main
+  paths:
+    exclude:
+      - azure-pipelines.yml
+      - .devcontainer/*
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+- name: 'tag'
+  value: '$(Build.BuildId)'
+- name: 'imagePullSecret'
+  value: 'aks-backend-secret'
+- group: catalog-service
+  
+stages:
+- stage: Build
+  displayName: 'Build'
+  jobs:
+  - job: Build
+    steps:
+    - task: SnykSecurityScan@1
+      displayName: 'Code analysis'
+      inputs:
+        serviceConnectionEndpoint: 'snyk-test'
+        testType: 'code'
+        codeSeverityThreshold: 'high'
+        failOnIssues: true
+        projectName: '$(snyk.project)'
+        organization: '$(snyk.organization)'
+
+    - task: Maven@3
+      displayName: 'Compile'
+      inputs:
+        mavenPomFile: 'pom.xml'
+        goals: 'compile'
+        options: '-DskipTests'
+        publishJUnitResults: false
+        javaHomeOption: 'JDKVersion'
+        jdkVersionOption: '1.17'
+        mavenVersionOption: 'Default'
+        mavenOptions: '-Xmx3072m'
+        mavenAuthenticateFeed: false
+        effectivePomSkip: false
+        sonarQubeRunAnalysis: false
+
+    - task: Maven@3
+      displayName: 'Unit test'
+      inputs:
+        mavenPomFile: 'pom.xml'
+        goals: 'test'
+        publishJUnitResults: true
+        testResultsFiles: '**/surefire-reports/TEST-*.xml'
+        codeCoverageToolOption: 'JaCoCo'
+        codeCoverageRestoreOriginalPomXml: true
+        javaHomeOption: 'JDKVersion'
+        jdkVersionOption: '1.17'
+        mavenVersionOption: 'Default'
+        mavenOptions: '-Xmx3072m'
+        mavenAuthenticateFeed: false
+        effectivePomSkip: false
+        sonarQubeRunAnalysis: false
+        
+    - task: SnykSecurityScan@1
+      displayName: 'Application analysis'
+      inputs:
+        serviceConnectionEndpoint: 'snyk-test'
+        testType: 'app'
+        targetFile: 'pom.xml'
+        severityThreshold: 'medium'
+        monitorWhen: 'noIssuesFound'
+        failOnIssues: true
+        projectName: '$(snyk.project)'
+        organization: '$(snyk.organization)'
+
+    - task: Docker@2
+      displayName: 'Build container image'
+      inputs:
+        containerRegistry: 'acr-backend'
+        repository: '$(image.name)'
+        command: 'build'
+        Dockerfile: '**/Dockerfile'
+        tags: '$(tag)'
+        addPipelineData: false
+        addBaseImageData: false
+
+    - task: SnykSecurityScan@1
+      displayName: 'Container analysis'
+      condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'), not(startsWith(variables['Build.SourceBranch'], 'refs/heads/feature/')))
+      inputs:
+        serviceConnectionEndpoint: 'snyk-test'
+        testType: 'container'
+        dockerImageName: '$(container.registry)/$(image.name):$(tag)'
+        dockerfilePath: 'Dockerfile'
+        severityThreshold: 'critical'
+        monitorWhen: 'always'
+        failOnIssues: true
+        projectName: '$(snyk.project)'
+        organization: '$(snyk.organization)'
+
+    - task: Docker@2
+      displayName: 'Push container image'
+      condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'), not(startsWith(variables['Build.SourceBranch'], 'refs/heads/feature/')))
+      inputs:
+        containerRegistry: 'acr-backend'
+        repository: '$(image.name)'
+        command: 'push'
+        tags: '$(tag)'
+        addPipelineData: false
+        addBaseImageData: false
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish manifests'
+      condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'), not(startsWith(variables['Build.SourceBranch'], 'refs/heads/feature/')))
+      inputs:
+        targetPath: '$(Pipeline.Workspace)/s/manifests/'
+        artifact: 'manifests'
+        publishLocation: 'pipeline'
+
+- stage: UAT
+  displayName: 'Deploy to UAT'
+  dependsOn: Build
+  condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'), not(startsWith(variables['Build.SourceBranch'], 'refs/heads/feature/')))
+  jobs:
+  - deployment: Deploy
+    displayName: Deploy
+    pool:
+      vmImage: ubuntu-latest
+    environment: 'uat'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: KubernetesManifest@0
+            displayName: 'Create imagePullSecret'
+            inputs:
+              action: 'createSecret'
+              kubernetesServiceConnection: 'uat-aks-backend-eastus2-001-uat-1708385208451'
+              namespace: 'uat'
+              secretType: 'dockerRegistry'
+              secretName: '$(imagePullSecret)'
+              dockerRegistryEndpoint: 'acr-backend'
+
+          - task: KubernetesManifest@0
+            displayName: Deploy to Kubernetes cluster
+            inputs:
+              action: 'deploy'
+              kubernetesServiceConnection: 'uat-aks-backend-eastus2-001-uat-1708385208451'
+              namespace: 'uat'
+              manifests: |
+                $(Pipeline.Workspace)/manifests/deployment.yml
+                $(Pipeline.Workspace)/manifests/service.yml
+              containers: '$(container.registry)/$(image.name):$(tag)'
+              imagePullSecrets: '$(imagePullSecret)'
+
+#  - job: APIM
+#    pool: server
+#    dependsOn: Deploy
+#    steps:
+#    - task: InvokeRESTAPI@1
+#      inputs:
+#        connectionType: 'connectedServiceName'
+#        serviceConnection: 'apim-backend'
+#        method: 'PUT'
+#        headers: |
+#          {
+#          "Content-Type":"application/json", 
+#          "Authorization":"SharedAccessSignature integration&20240405214215&5UZNrshP4RxytTcvNuiSMFnszE2aA3ZeiW3cKz3f8bXgUsGhj2rwqayN2w1D19sd0yaE4WkF7nbzh9aY/woUHA=="
+#          }
+#        body: |
+#          {
+#            "properties": {
+#              "format": "openapi-link",
+#              "value": "http://20.57.96.45:8080/api-docs",
+#              "path": "catalog-uat"
+#            }
+#          }
+#        urlSuffix: 'subscriptions/af3aa9f1-81dc-470c-8f25-c12dcfa4c842/resourceGroups/rg-aksbackend-eastus2-001/providers/Microsoft.ApiManagement/service/apim-test-backend-001/apis/catalog-uat?api-version=2022-08-01'
+#        waitForCompletion: 'false'
+
+- stage: Prod
+  displayName: 'Deploy to Prod'
+  dependsOn: UAT
+  condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'), not(startsWith(variables['Build.SourceBranch'], 'refs/heads/feature/')))
+  jobs:
+  - deployment: Deploy
+    displayName: Deploy
+    pool:
+      vmImage: ubuntu-latest
+    environment: 'prod'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: KubernetesManifest@0
+            displayName: 'Create imagePullSecret'
+            inputs:
+              action: 'createSecret'
+              kubernetesServiceConnection: 'prod-aks-backend-eastus2-001-prod-1708385257342'
+              namespace: 'prod'
+              secretType: 'dockerRegistry'
+              secretName: '$(imagePullSecret)'
+              dockerRegistryEndpoint: 'acr-backend'
+
+          - task: KubernetesManifest@0
+            displayName: Deploy to Kubernetes cluster
+            inputs:
+              action: 'deploy'
+              kubernetesServiceConnection: 'prod-aks-backend-eastus2-001-prod-1708385257342'
+              namespace: 'prod'
+              manifests: |
+                $(Pipeline.Workspace)/manifests/deployment.yml
+                $(Pipeline.Workspace)/manifests/service.yml
+              containers: '$(container.registry)/$(image.name):$(tag)'
+              imagePullSecrets: '$(imagePullSecret)'

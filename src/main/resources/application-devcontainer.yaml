@@ -1,0 +1,24 @@
+spring:
+  data:
+    mongodb:
+      uri: mongodb://catalog:password@mongodb:27017/catalog
+      database: catalog
+
+springdoc:
+  api-docs:
+    path: /api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+
+otel:
+  exporter:
+    otlp:
+      endpoint: http://collector:4318
+  service:
+    name: catalog-service
+  traces:
+    exporter: otlp
+  metrics:
+    exporter: otlp
+  logs:
+    exporter: otlp
