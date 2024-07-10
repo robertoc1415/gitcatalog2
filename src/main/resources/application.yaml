@@ -6,9 +6,9 @@ spring:
 
 springdoc:
   api-docs:
-    path: /api-docs2
+    path: /api-docs
   swagger-ui:
-    path: /swagger2-ui.html
+    path: /swagger-ui.html
 
 otel:
   exporter:
